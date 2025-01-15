@@ -3,6 +3,8 @@ import sys
 import os
 import pandas as pd
 from functools import cache
+import json
+import numpy as np
 
 import timeit # for timing the code
 
@@ -12,16 +14,28 @@ TABLE_HEADER_SIZE = 211 # The size of the header of the table in bytes
 END_OF_PLAYERS_SECTION = [0x00, 0x00, 0x00, 0x00]
 START_OF_SCORES_SECTION = [0x03, 0x00, 0x00, 0x01]
 
+START_OF_MESSAGE_SECTION = [0x02, 0x58, 0x74, 0xF0]
+END_OF_MESSAGE_SECTION = [0x11, 0x01]
+
 # Score table delimination
+# There's some more stuff like damageZone and awardDamage but I stopped with this before I figured that out
 ROW_SIZE = 152
 AIR_KILLS = 16
 GROUND_KILLS = 24
+NAVAL_KILLS = 32
+TEAM_KILLS = 40
+AI_AIR_KILLS = 48
+AI_GROUND_KILLS = 56
+AI_NAVAL_KILLS = 64
 ASSISTS = 72
 DEATHS = 80 #83
 CAPTURES = 88
 SQUAD = 128
+AUTO_SQUAD = 136
 TEAM = 144
+DAMAGE_ZONE = [96, 97]
 SCORE = [104,105]
+AWARD_DAMAGE = [110, 111]
 
 PLAYER_ID_OFFSET = -1
 VEHICLE_NAME_LENGTH = 6
@@ -49,7 +63,7 @@ def get_players(playersTable):
     
     # Split the table on \x00
     splitTable = playersTable.split(b'\x00')
-    # reverse the list as its easier to split on the ID
+    # Reverse the list as its easier to split on the ID
     splitTable.reverse()
 
     players = dict()
@@ -60,7 +74,7 @@ def get_players(playersTable):
             # This is an ID
             ID = int(entry.decode("utf-8"))
             clanTag = None
-            # if the 2nd next entry is not a digit then this player has a clan tag
+            # If the 2nd next entry is not a digit then this player has a clan tag
             if not splitTable[i+2].isdigit():
                 # The next entry is the clan tag
                 clanTag = splitTable[i+1].decode("utf-8")
@@ -72,7 +86,7 @@ def get_players(playersTable):
             # Add the player to the dict
             players[ID] = {"ID" :ID, "name":name, "clanTag":clanTag, "index":playerIndex}
             playerIndex += 1
-    # because we reversed the list we need to reverse player indexs'
+    # Because we reversed the list we need to reverse player indexs'
     for player in players.values():
         player["index"] = playerIndex - player["index"] - 1
     return players
@@ -91,19 +105,30 @@ def get_scores(scoresTable, players):
         for ID, player in players.items():
             if player["index"] == i:
                 break
+
         players[ID]["airKills"] = int.from_bytes(row[AIR_KILLS:AIR_KILLS+4], byteorder="little")
         players[ID]["groundKills"] = int.from_bytes(row[GROUND_KILLS:GROUND_KILLS+4], byteorder="little")
+        players[ID]["navalKills"] = int.from_bytes(row[NAVAL_KILLS:NAVAL_KILLS+4], byteorder="little")
+        players[ID]["teamKills"] = int.from_bytes(row[TEAM_KILLS:TEAM_KILLS+4], byteorder="little")
+        players[ID]["aiAirKills"] = int.from_bytes(row[AI_AIR_KILLS:AI_AIR_KILLS+4], byteorder="little")
+        players[ID]["aiGroundKills"] = int.from_bytes(row[AI_GROUND_KILLS:AI_GROUND_KILLS+4], byteorder="little")
+        players[ID]["aiNavalKills"] = int.from_bytes(row[AI_NAVAL_KILLS:AI_NAVAL_KILLS+4], byteorder="little")
         players[ID]["assists"] = row[ASSISTS]
         players[ID]["deaths"] = row[DEATHS]
         players[ID]["captures"] = row[CAPTURES]
-        players[ID]["squad"] = row[SQUAD]
+        try:
+            players[ID]["squad"] = row[SQUAD]
+        except:
+            # idk I forgot
+            continue
+        players[ID]["autoSquad"] = row[AUTO_SQUAD]
         players[ID]["team"] = row[TEAM]
         players[ID]["score"] = row[SCORE[0]] + row[SCORE[1]]*256
     return players
 
 @cache
 def lookup_nation(vehicleName):
-    # for speed we first just check if the nation is present in the name
+    # For speed we first just check if the nation is present in the name
     nations = {
         "us_" : "USA",
         "ussr_" : "USSR",
@@ -121,49 +146,115 @@ def lookup_nation(vehicleName):
         if nation == vehicleName[:len(nation)]:
             return nations[nation]
 
-    # if we couldn't find the nation in the name, we need to look it up
+    # If we couldn't find the nation in the name, we need to look it up
 
-    # read in the lookup.txt
+    # Read in the lookup.txt
     with open("lookup.txt", "r", encoding="utf-8") as f:
         lookup = f.read()
     
-    # find index of vehicle name
+    # Find index of vehicle name
     vehicleNameIndex = lookup.find(vehicleName)
 
-    # if the vehicle name is not found, return None
+    # If the vehicle name is not found, return None
     if vehicleNameIndex == -1:
         return None
     
-    # once the vehicle name is found, index back to the nation
-    # nation is a like similar to "==== Great Britain ===="
+    # Once the vehicle name is found, index back to the nation
+    # Nation is a like similar to "==== Great Britain ===="
     endOfNationIndex = lookup.rfind("====", 0, vehicleNameIndex)
 
-    # nation is the string between the last ==== and the next ====
+    # Nation is the string between the last ==== and the next ====
     startOfNationIndex = lookup.rfind("====", 0, endOfNationIndex-1) + 4
     nation = lookup[startOfNationIndex:endOfNationIndex-1]
-    # if nations is allowed, return the nation
+    # If nations is allowed, return the nation
     if nation not in ['drones', 'Nuclear bombers', 'Special']:
         return nation
     return None
 
+def find_byte_sequence(data, pattern):
+    occurrences = []
+    pattern_length = len(pattern)
+    data_length = len(data)
+
+    for i in range(data_length - pattern_length + 1):
+        match = True
+        for j in range(pattern_length):
+            if pattern[j] != b'.'[0] and data[i+j] != pattern[j]:
+                match = False
+                break
+        if match:
+            occurrences.append(i)
+
+    return occurrences
+
+def get_messages(data, players):
+    # Search for occurences of the following bytes
+    # Use a raw string and escape the dots to match any byte
+
+    # This was the old lookup
+    # lookup = b'\xFF........\x00'
+
+    # This is the new one, not ideal as it's a lot slower but it works
+    # This will also retrieve vehicle ids (like us_m19)
+    # I have countered this by using the units.csv from the datamines to match these and remove them
+    # I have this implemented in the javascript version of this script, that's why I'm not doing it here
+    lookup = b'...\x00'
+
+    # Find all occurences
+    occurrences = [m.start() for m in re.finditer(lookup, data, re.DOTALL)]
+
+    messages = []
+    for start in occurrences:
+        try:
+            # player name length byte is 1 byte after the occurrence
+            playerNameLength = data[start + len(lookup)]
+            
+            # Extract player name
+            nameStart = start + len(lookup) + 1
+            playerName = data[nameStart:nameStart+playerNameLength].decode('utf-8', errors='ignore')
+
+            for ID, player in players.items():
+                if player["name"] == playerName:
+                    # Find message length
+                    messageStart = nameStart + playerNameLength
+                    messageLengthByte = data[messageStart]
+                    
+                    # Extract message
+                    messageStart += 1
+                    message = data[messageStart:messageStart+messageLengthByte].decode('utf-8', errors='ignore')
+
+                    # Check if it is "all", "team", or "squad" chat
+                    if messageStart + messageLengthByte < len(data):  # Ensure we don't go out of bounds
+                        chatTypeByte = data[messageStart + messageLengthByte]
+                        if chatTypeByte == 1:
+                            chatType = "all"
+                        elif chatTypeByte == 2:
+                            chatType = "squad"
+                        else:
+                            chatType = "team"
+                    else:
+                        chatType = "unknown"
+                                        
+                    messages.append((playerName, message, chatType))
+        except:
+            continue
+
+    return messages
 
 def get_vehicles(data, numberOfPlayers):
-    # search for occurences of the following bytes
+    # Search for occurences of the following bytes
     lookup = b'\x90..\x01\x20\x01'
-    # find all occurences
+    # Find all occurences
     occurences = [m.start() for m in re.finditer(lookup, data, re.DOTALL)]
-    # player ID is 4 bytes before the occurence
+    # Player ID is 4 bytes before the occurence
     playerIndex = [int(data[i+PLAYER_ID_OFFSET]) for i in occurences]
-    # for some reason, the player Index is offset by the number of players
+    # For some reason, the player Index is offset by the number of players
     playerIndex = [i-(min(playerIndex)) for i in playerIndex]
 
     vehicleNameLengths = [int(data[i+VEHICLE_NAME_LENGTH]) for i in occurences]
     vehicleNames = [data[i+VEHICLE_NAME_START:i+VEHICLE_NAME_START+length].decode("utf-8") for i,length in zip(occurences, vehicleNameLengths)]
-    # print ID and vehicle name
-    for ID, name in zip(playerIndex, vehicleNames):
-        print(f"{ID}\t{name}")
     
-    # create a dict of player IDs and vehicle names
+    # Create a dict of player IDs and vehicle names
     playerVehicles = dict()
     for index, vehicleName in zip(playerIndex, vehicleNames):
         if index not in playerVehicles:
@@ -173,9 +264,9 @@ def get_vehicles(data, numberOfPlayers):
     return playerVehicles
 
 def get_a_winning_player(data):
-    # look for 'hidden_win_streak' in the data
+    # Look for 'hidden_win_streak' in the data
     winningPlayer = data.find(b'hidden_win_streak')
-    # the winning player is 5 bytes before the string
+    # The winning player is 5 bytes before the string
     winningPlayer = data[winningPlayer-5]
     return winningPlayer
     
@@ -193,6 +284,7 @@ def parse_replay_data(data):
     playersTable = resultsTable[TABLE_HEADER_SIZE:endOfPlayersTable]
 
     players = get_players(playersTable)
+    messages = get_messages(data, players)
 
     # Scores is from the players table to the START_OF_SCORES_SECTION
     scoresTable = resultsTable[endOfPlayersTable + len(END_OF_PLAYERS_SECTION):]
@@ -200,24 +292,27 @@ def parse_replay_data(data):
     scoresTable = scoresTable[startOfScoresTable + len(START_OF_SCORES_SECTION):]
 
     players = get_scores(scoresTable, players)
-
     
-    # get a winning player
+    # Get a winning player
     winningPlayer = get_a_winning_player(data)
     for ID, player in players.items():
         if player["index"] == winningPlayer:
             winningTeam = player["team"]
             break
     
-    # initialise vehicles and winning team
+    # Initialise vehicles and winning team
     for player in players.values():
-        player["vehicles"] = []
-        if player["team"] == winningTeam:
-            player["win"] = True
-        else:
-            player["win"] = False
+        try:
+            player["vehicles"] = []
+            if player["team"] == winningTeam:
+                player["win"] = True
+            else:
+                player["win"] = False
+        except:
+            # idk I forgot
+            continue
 
-    # parse vehicles
+    # Parse vehicles
     vehiclesList = get_vehicles(data, len(players))
     for index, vehicles in vehiclesList.items():
         for ID, player in players.items():
@@ -225,7 +320,7 @@ def parse_replay_data(data):
                 break
         if 'dummy_plane' not in vehicles:
             players[ID]["vehicles"] = vehicles
-            # get nation
+            # Get nation
             for vehicle in vehicles:
                 nation = lookup_nation(vehicle)
                 if nation is not None:
@@ -236,18 +331,27 @@ def parse_replay_data(data):
 
 
     
-    return players
+    return players, messages
+
+def convert_sets_to_lists(obj):
+    if isinstance(obj, set):
+        return list(obj)
+    elif isinstance(obj, dict):
+        return {k: convert_sets_to_lists(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_sets_to_lists(i) for i in obj]
+    else:
+        return obj
 
 def main():
 
     file = sys.argv[1]
     
-    # expect a path to a folder, read all files in the folder and concat them
-    
+    # Expect a path to a folder, read all files in the folder and concat them
     if os.path.isdir(file):
         data = b''
         for f in os.listdir(file):
-            #only parse the files with an odd number
+            # Only parse the files with an odd number
             # eg: 0007.wrpl
             if int(f.split(".")[0]) % 2 == 0:
                 continue
@@ -256,26 +360,20 @@ def main():
     else:
         with open(file, "rb") as replay:
             data = replay.read()
+
+    # Write the concatenated data to replay.bin
+    # You don't need to do this, it's just for debugging and finding hex values etc easier
+    with open('replay.bin', 'wb') as replay_file:
+        replay_file.write(data)
     
     start = timeStart()
-    players = parse_replay_data(data)
+    players, messages = parse_replay_data(data)
     timeEnd(start)
 
+    players_serializable = convert_sets_to_lists(players)
 
-    for player in players.values():
-        print(player["index"], end="\t")
-        print(player["team"], end="\t")
-        print(player["win"], end="\t")
-        try:
-            print(player["nation"], end="\t")
-        except:
-            print("Nation", end="\t")
-        print(player["ID"], end="\t")
-        try:
-            print(player["name"], end="\t")
-        except:
-            print("Chinese Name", end="\t")
-        print(f"{player['score']}, {player['airKills']}, {player['groundKills']}, {player['assists']}, {player['captures']}, {player['deaths']}, {player['vehicles']}")
+    print(json.dumps({"players": players_serializable}, indent=4))
+    print(json.dumps({"messages": messages}, indent=4))
   
 
 if __name__ == "__main__":
